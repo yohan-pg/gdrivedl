@@ -7,6 +7,8 @@ import sys
 import unicodedata
 import argparse
 import logging
+import queue
+import threading
 
 try:
     #Python3
@@ -94,16 +96,32 @@ def url_to_id(url):
     sys.exit(1)
 
 class GDriveDL(object):
-    def __init__(self, quiet=False, overwrite=False):
+    def __init__(self, quiet=False, overwrite=False, workers=4):
         self._quiet = quiet
+        self._workers = workers
         self._overwrite = overwrite
         self._create_empty_dirs = True
+
+        self._kill = False
+        self._work_queue = queue.Queue()
+        self._resp_queue = queue.Queue()
         self._opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
     def _request(self, url):
         logging.debug('Requesting: {}'.format(url))
         req = Request(url, headers={'User-Agent': USER_AGENT})
         return self._opener.open(req)
+
+    def _worker(self):
+        while not self._work_queue.empty():
+            item = self._work_queue.get_nowait()
+            try:
+                func = item.pop(0)
+                self._resp_queue.put(func(*item))
+            except Exception as e:
+                self._resp_queue.put(e)
+            finally:
+                self._work_queue.task_done()
 
     def process_url(self, url, directory, filename=None):
         id = url_to_id(url)
@@ -114,7 +132,7 @@ class GDriveDL(object):
             url = resp.geturl()
 
         if '/file/' in url.lower():
-            self.process_file(id, directory, filename=filename)
+            self.process_file(id, directory, filename)
         elif '/folders/' in url.lower():
             if filename:
                 logging.warn("Ignoring --output-document option for folder download")
@@ -122,6 +140,28 @@ class GDriveDL(object):
         else:
             logging.error('That id {} returned an unknown url {}'.format(id, url))
             sys.exit(1)
+
+        threads = []
+        logging.debug('Starting {} workers'.format(self._workers))
+
+        try:
+            for i in range(self._workers):
+                thread = threading.Thread(target=self._worker)
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+
+            while not self._work_queue.empty():
+                result = self._resp_queue.get()
+                if isinstance(result, Exception):
+                    raise
+        except:
+            with self._work_queue.mutex:
+                self._work_queue.queue.clear()
+            self._kill = True
+
+        for thread in threads:
+            thread.join()
 
     def process_folder(self, id, directory):
         url = FOLDER_URL.format(id=id)
@@ -134,18 +174,18 @@ class GDriveDL(object):
             logging.error('Folder: {} does not have link sharing enabled'.format(id))
             sys.exit(1)
 
+        if self._create_empty_dirs and not matches:
+            os.makedirs(directory)
+            logging.info('Directory: {directory} [Created]'.format(directory=directory))
+
         for match in matches:
             url, item_name = match
             id = url_to_id(url)
 
             if '/file/' in url.lower():
-                self.process_file(id, directory, filename=sanitize(item_name))
+                self._work_queue.put([self.process_file, id, directory, sanitize(item_name)])
             elif '/folders/' in url.lower():
-                self.process_folder(id, os.path.join(directory, sanitize(item_name)))
-
-        if self._create_empty_dirs and not os.path.exists(directory):
-            os.makedirs(directory)
-            logging.info('Directory: {directory} [Created]'.format(directory=directory))
+                self._work_queue.put([self.process_folder, id, os.path.join(directory, sanitize(item_name))])
 
     def process_file(self, id, directory, filename=None, confirm=''):
         file_path = None
@@ -180,13 +220,15 @@ class GDriveDL(object):
             os.makedirs(directory)
             logging.info('Directory: {directory} [Created]'.format(directory=directory))
 
+        success = False
         try:
             with open(file_path, 'wb') as f:
                 dl = 0
                 last_out = 0
-                while True:
+                while not self._kill:
                     chunk = resp.read(CHUNKSIZE)
                     if not chunk:
+                        success = True
                         break
 
                     if b'Too many users have viewed or downloaded this file recently' in chunk:
@@ -203,12 +245,13 @@ class GDriveDL(object):
                         last_out = dl
                         sys.stdout.flush()
         except:
-            if os.path.exists(file_path):
-                os.remove(file_path)
             raise
+        finally:
+            if not success and os.path.exists(file_path):
+                os.remove(file_path)
 
-        if not self._quiet:
-            output('\n')
+            if success and not self._quiet:
+                output('\n')
 
 
 def main(args=None):
